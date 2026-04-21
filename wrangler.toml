@@ -11,14 +11,14 @@ id = "863ff3bfccad47ae9a5e8a1b39f77f2b"
 # Add any environment variables here if needed
 
 [observability]
-enabled = false
+enabled = true
 head_sampling_rate = 1
 
 [observability.logs]
 enabled = true
 head_sampling_rate = 1
 persist = true
-invocation_logs = false
+invocation_logs = true
 
 [observability.traces]
 enabled = false
