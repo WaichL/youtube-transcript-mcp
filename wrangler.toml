@@ -7,8 +7,9 @@ compatibility_flags = ["nodejs_compat"]
 binding = "TRANSCRIPT_CACHE"
 id = "863ff3bfccad47ae9a5e8a1b39f77f2b"
 
-# Remove any durable_objects configuration
-# Remove any environment variables related to GitHub OAuth
-
 [vars]
 # Add any environment variables here if needed
+
+[observability.logs]
+enabled = true
+invocation_logs = false
