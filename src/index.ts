@@ -44,6 +44,17 @@ function jsonResp(body: unknown, status = 200, extra?: Record<string, string>): 
   });
 }
 
+// RFC 9728: OAuth Protected Resource Metadata
+function oauthProtectedResource(req: Request): Response {
+  const b = baseUrl(req);
+  return jsonResp({
+    resource: b,
+    authorization_servers: [b],
+    bearer_methods_supported: ['header'],
+    resource_documentation: `${b}/`,
+  });
+}
+
 function oauthMeta(req: Request): Response {
   const b = baseUrl(req);
   return jsonResp({
@@ -135,9 +146,7 @@ async function oauthToken(req: Request, env: Env): Promise<Response> {
 
   const grantType = params.get('grant_type') ?? '';
 
-  // client_credentials grant — Perplexity manual client_id + client_secret flow
   if (grantType === 'client_credentials') {
-    // Support both body params and Basic auth header
     let clientId     = params.get('client_id')     ?? '';
     let clientSecret = params.get('client_secret') ?? '';
 
@@ -145,16 +154,12 @@ async function oauthToken(req: Request, env: Env): Promise<Response> {
     if (authHeader.startsWith('Basic ')) {
       const decoded = atob(authHeader.slice(6));
       const sep = decoded.indexOf(':');
-      if (sep !== -1) {
-        clientId     = decoded.slice(0, sep);
-        clientSecret = decoded.slice(sep + 1);
-      }
+      if (sep !== -1) { clientId = decoded.slice(0, sep); clientSecret = decoded.slice(sep + 1); }
     }
 
     if (!env.OAUTH_CLIENT_ID || !env.OAUTH_CLIENT_SECRET) {
-      return jsonResp({ error: 'server_error', error_description: 'OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET secrets not set in Worker' }, 500);
+      return jsonResp({ error: 'server_error', error_description: 'OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET not configured' }, 500);
     }
-
     if (clientId !== env.OAUTH_CLIENT_ID || clientSecret !== env.OAUTH_CLIENT_SECRET) {
       return jsonResp({ error: 'invalid_client' }, 401);
     }
@@ -164,7 +169,6 @@ async function oauthToken(req: Request, env: Env): Promise<Response> {
     return jsonResp({ access_token: token, token_type: 'Bearer', expires_in: 30 * 24 * 3600 });
   }
 
-  // authorization_code grant
   if (grantType === 'authorization_code') {
     const code = params.get('code') ?? '';
     const raw  = await env.TRANSCRIPT_CACHE.get(`oauth:code:${code}`);
@@ -183,6 +187,21 @@ async function oauthToken(req: Request, env: Env): Promise<Response> {
   }
 
   return jsonResp({ error: 'unsupported_grant_type' }, 400);
+}
+
+function makeSseStream(ctx: ExecutionContext): Response {
+  const { readable, writable } = new TransformStream();
+  const writer  = writable.getWriter();
+  const encoder = new TextEncoder();
+  ctx.waitUntil((async () => {
+    try {
+      await writer.write(encoder.encode('data: ' + JSON.stringify({ jsonrpc:'2.0', method:'notifications/initialized', params:{} }) + '\n\n'));
+      const ka = setInterval(() => writer.write(encoder.encode(': keepalive\n\n')).catch(() => clearInterval(ka)), 30000);
+    } catch (e) { console.error('SSE stream error:', e); }
+  })());
+  return new Response(readable, {
+    headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', ...CORS },
+  });
 }
 
 class SimpleMCPServer {
@@ -224,49 +243,49 @@ export default {
 
     if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS });
 
+    // RFC 9728: Protected resource metadata (Perplexity checks this for each resource path)
+    if (url.pathname.startsWith('/.well-known/oauth-protected-resource')) {
+      return oauthProtectedResource(request);
+    }
+
+    // OAuth discovery & flow (no auth required)
     if (url.pathname === '/.well-known/oauth-authorization-server') return oauthMeta(request);
     if (url.pathname === '/oauth/register' && request.method === 'POST') return oauthRegister(request, env);
     if (url.pathname === '/oauth/authorize') return oauthAuthorize(request, env);
     if (url.pathname === '/oauth/token' && request.method === 'POST') return oauthToken(request, env);
 
+    // Protected MCP routes
     if (url.pathname === '/sse' || url.pathname === '/mcp') {
       if (!(await validToken(request, env))) {
         return new Response(JSON.stringify({ error: 'unauthorized' }), {
           status: 401,
-          headers: { 'Content-Type': 'application/json', 'WWW-Authenticate': 'Bearer', ...CORS },
+          headers: {
+            'Content-Type': 'application/json',
+            'WWW-Authenticate': 'Bearer resource_metadata="' + baseUrl(request) + '/.well-known/oauth-protected-resource"',
+            ...CORS,
+          },
         });
       }
     }
 
     const mcpServer = new SimpleMCPServer(env);
 
-    if (url.pathname === '/sse') {
-      if (request.method === 'POST') {
-        try {
-          const response = await mcpServer.handleRequest(await request.json());
-          return new Response('data: ' + JSON.stringify(response) + '\n\n', { headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', ...CORS } });
-        } catch {
-          return new Response('data: ' + JSON.stringify({ jsonrpc:'2.0',id:null,error:{code:-32603,message:'Internal error'} }) + '\n\n', { headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', ...CORS } });
-        }
-      }
-      const { readable, writable } = new TransformStream();
-      const writer = writable.getWriter();
-      const encoder = new TextEncoder();
-      ctx.waitUntil((async () => {
-        try {
-          await writer.write(encoder.encode('data: ' + JSON.stringify({ jsonrpc:'2.0',method:'notifications/initialized',params:{} }) + '\n\n'));
-          const ka = setInterval(() => writer.write(encoder.encode(': keepalive\n\n')).catch(() => clearInterval(ka)), 30000);
-        } catch (e) { console.error('SSE error:', e); }
-      })());
-      return new Response(readable, { headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', ...CORS } });
+    // SSE stream (GET /sse or GET /mcp — Streamable HTTP spec uses GET /mcp)
+    if ((url.pathname === '/sse' || url.pathname === '/mcp') && request.method === 'GET') {
+      return makeSseStream(ctx);
     }
 
-    if (url.pathname === '/mcp' && request.method === 'POST') {
+    // MCP JSON-RPC over POST (both /sse and /mcp)
+    if ((url.pathname === '/sse' || url.pathname === '/mcp') && request.method === 'POST') {
       try {
         const response = await mcpServer.handleRequest(await request.json());
-        return new Response(JSON.stringify(response), { headers: { 'Content-Type': 'application/json', ...CORS } });
+        return new Response('data: ' + JSON.stringify(response) + '\n\n', {
+          headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', ...CORS },
+        });
       } catch {
-        return new Response(JSON.stringify({ jsonrpc:'2.0',id:null,error:{code:-32603,message:'Internal error'} }), { status: 500, headers: { 'Content-Type': 'application/json', ...CORS } });
+        return new Response('data: ' + JSON.stringify({ jsonrpc:'2.0',id:null,error:{code:-32603,message:'Internal error'} }) + '\n\n', {
+          headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', ...CORS },
+        });
       }
     }
 
